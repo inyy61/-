@@ -1,0 +1,380 @@
+classdef LanChatApp < matlab.apps.AppBase
+    % LANCHATAPP MATLAB局域网双机聊天App
+    % 适用版本: MATLAB R2021a 或更高
+    
+    % =====================================================================
+    % 属性定义区域
+    % =====================================================================
+    properties (Access = public)
+        UIFigure            % 主窗口
+        MainGrid            % 主网格布局
+        TopGrid             % 顶部控制区网格
+        BottomGrid          % 底部输入区网格
+        
+        % 左侧服务端组件
+        ServerPanel         matlab.ui.container.Panel
+        ServerPortEdit      matlab.ui.control.NumericEditField
+        ServerStartBtn      matlab.ui.control.Button
+        ServerStopBtn       matlab.ui.control.Button
+        ServerStatusLabel   matlab.ui.control.Label
+        
+        % 右侧客户端组件
+        ClientPanel         matlab.ui.container.Panel
+        ClientIPEdit        matlab.ui.control.EditField
+        ClientPortEdit      matlab.ui.control.NumericEditField
+        ClientConnectBtn    matlab.ui.control.Button
+        ClientDisconnBtn    matlab.ui.control.Button
+        ClientStatusLabel   matlab.ui.control.Label
+        
+        % 聊天与输入组件
+        ChatHistoryArea     matlab.ui.control.TextArea
+        MessageInputField   matlab.ui.control.TextArea
+        SendBtn             matlab.ui.control.Button
+    end
+    
+    properties (Access = private)
+        Server              % tcpserver 对象
+        Client              % tcpclient 对象
+        ConnectionMode      % 当前模式：'none', 'server', 'client'
+        IsConnected         % 通信是否已建立(布尔值)
+    end
+    
+    % =====================================================================
+    % 核心业务方法 (网络与通信)
+    % =====================================================================
+    methods (Access = private)
+        
+        %% 服务端逻辑
+        function startServer(app, ~, ~)
+            port = app.ServerPortEdit.Value;
+            try
+                % 1. 创建tcpserver对象 (监听所有IP)
+                app.Server = tcpserver("0.0.0.0", port);
+                
+                % 2. 设置回调和终止符
+                app.Server.ConnectionChangedFcn = @app.serverConnectionChanged;
+                configureTerminator(app.Server, "LF");
+                configureCallback(app.Server, "terminator", @app.receiveMessage);
+                
+                % 3. 更新状态
+                app.ConnectionMode = 'server';
+                app.updateUIState('server_listening');
+                app.appendChatMsg('系统', sprintf('服务已启动，正在监听端口 %d...', port));
+            catch ME
+                uialert(app.UIFigure, ME.message, '服务端启动失败');
+                app.stopServer();
+            end
+        end
+        
+        function stopServer(app, ~, ~)
+            if ~isempty(app.Server)
+                delete(app.Server);
+                app.Server =[];
+            end
+            app.ConnectionMode = 'none';
+            app.IsConnected = false;
+            app.updateUIState('disconnected');
+            app.appendChatMsg('系统', '服务端已停止监听。');
+        end
+        
+        function serverConnectionChanged(app, src, ~)
+            % 必须使用 drawnow 或在UI线程更新
+            if src.Connected
+                app.IsConnected = true;
+                app.ServerStatusLabel.Text = '状态: 已连接客户端';
+                app.ServerStatusLabel.FontColor = [0 0.6 0]; % 绿色
+                app.appendChatMsg('系统', '客户端已连接！');
+                app.SendBtn.Enable = 'on';
+            else
+                app.IsConnected = false;
+                app.ServerStatusLabel.Text = '状态: 监听中(客户端断开)';
+                app.ServerStatusLabel.FontColor =[0.8 0.6 0]; % 黄色
+                app.appendChatMsg('系统', '客户端已断开连接。');
+                app.SendBtn.Enable = 'off';
+            end
+        end
+        
+        %% 客户端逻辑
+        function connectToServer(app, ~, ~)
+            ip = app.ClientIPEdit.Value;
+            port = app.ClientPortEdit.Value;
+            try
+                app.updateUIState('client_connecting');
+                
+                % 1. 创建tcpclient对象
+                app.Client = tcpclient(ip, port, "Timeout", 5);
+                
+                % 2. 设置回调和终止符
+                configureTerminator(app.Client, "LF");
+                configureCallback(app.Client, "terminator", @app.receiveMessage);
+                
+                % 3. 更新状态
+                app.ConnectionMode = 'client';
+                app.IsConnected = true;
+                app.updateUIState('client_connected');
+                app.appendChatMsg('系统', sprintf('成功连接到服务器 %s:%d', ip, port));
+            catch ME
+                uialert(app.UIFigure, '连接超时或目标拒绝连接，请检查IP和端口。', '连接失败');
+                app.disconnectFromServer();
+            end
+        end
+        
+        function disconnectFromServer(app, ~, ~)
+            if ~isempty(app.Client)
+                delete(app.Client);
+                app.Client =[];
+            end
+            app.ConnectionMode = 'none';
+            app.IsConnected = false;
+            app.updateUIState('disconnected');
+            app.appendChatMsg('系统', '已断开与服务器的连接。');
+        end
+        
+        %% 消息收发逻辑
+        function sendMessage(app, ~, ~)
+            if ~app.IsConnected
+                uialert(app.UIFigure, '当前未连接，无法发送消息！', '发送错误');
+                return;
+            end
+            
+            % 获取输入内容并将多行转换为单行字符串（以空格连接，因为协议以\n作为分隔符）
+            rawMsg = app.MessageInputField.Value;
+            if isempty(rawMsg), return; end
+            msgStr = strjoin(rawMsg, ' '); 
+            if strlength(strtrim(msgStr)) == 0, return; end
+            
+            try
+                % 发送数据
+                if strcmp(app.ConnectionMode, 'server')
+                    writeline(app.Server, msgStr);
+                elseif strcmp(app.ConnectionMode, 'client')
+                    writeline(app.Client, msgStr);
+                end
+                
+                % 本地显示并清空输入框
+                app.appendChatMsg('我', msgStr);
+                app.MessageInputField.Value = '';
+            catch ME
+                uialert(app.UIFigure, '发送失败，连接可能已断开。', '网络错误');
+                if strcmp(app.ConnectionMode, 'server'), app.stopServer(); end
+                if strcmp(app.ConnectionMode, 'client'), app.disconnectFromServer(); end
+            end
+        end
+        
+        function receiveMessage(app, src, ~)
+            % 从TCP流读取一行数据
+            if src.NumBytesAvailable > 0
+                data = readline(src);
+                % 追加到聊天记录（处理为异步，直接更新UI在R2021a通常是安全的，但最好保障）
+                app.appendChatMsg('对方', data);
+            end
+        end
+        
+        %% 辅助方法
+        function appendChatMsg(app, sender, msg)
+            timestamp = char(datetime('now', 'Format', 'HH:mm:ss'));
+            newMsg = sprintf('[%s] %s: %s', timestamp, sender, msg);
+            
+            % 获取现有记录并追加
+            currentText = app.ChatHistoryArea.Value;
+            if isempty(currentText)
+                app.ChatHistoryArea.Value = {newMsg};
+            else
+                if ischar(currentText)
+                    currentText = {currentText}; % 防呆处理
+                end
+                app.ChatHistoryArea.Value =[currentText; {newMsg}];
+            end
+            
+            % 自动滚动到底部
+            scroll(app.ChatHistoryArea, 'bottom');
+        end
+        
+        function updateUIState(app, state)
+            % 状态机更新UI控制权限和标签颜色
+            switch state
+                case 'disconnected'
+                    % 恢复初始状态
+                    app.ServerPortEdit.Enable = 'on';
+                    app.ServerStartBtn.Enable = 'on';
+                    app.ServerStopBtn.Enable = 'off';
+                    app.ServerStatusLabel.Text = '状态: 未启动';
+                    app.ServerStatusLabel.FontColor =[0.6 0 0]; % 红
+                    
+                    app.ClientIPEdit.Enable = 'on';
+                    app.ClientPortEdit.Enable = 'on';
+                    app.ClientConnectBtn.Enable = 'on';
+                    app.ClientDisconnBtn.Enable = 'off';
+                    app.ClientStatusLabel.Text = '状态: 未连接';
+                    app.ClientStatusLabel.FontColor = [0.6 0 0]; % 红
+                    
+                    app.ClientPanel.Enable = 'on';
+                    app.ServerPanel.Enable = 'on';
+                    app.SendBtn.Enable = 'off';
+                    
+                case 'server_listening'
+                    app.ServerPortEdit.Enable = 'off';
+                    app.ServerStartBtn.Enable = 'off';
+                    app.ServerStopBtn.Enable = 'on';
+                    app.ServerStatusLabel.Text = '状态: 监听中...';
+                    app.ServerStatusLabel.FontColor =[0.8 0.6 0]; % 黄色
+                    
+                    app.ClientPanel.Enable = 'off'; % 禁用客户端面板
+                    app.SendBtn.Enable = 'off';     % 必须等对方连入
+                    
+                case 'client_connecting'
+                    app.ClientConnectBtn.Enable = 'off';
+                    app.ClientStatusLabel.Text = '状态: 连接中...';
+                    app.ClientStatusLabel.FontColor = [0.8 0.6 0]; % 黄色
+                    
+                case 'client_connected'
+                    app.ClientIPEdit.Enable = 'off';
+                    app.ClientPortEdit.Enable = 'off';
+                    app.ClientConnectBtn.Enable = 'off';
+                    app.ClientDisconnBtn.Enable = 'on';
+                    app.ClientStatusLabel.Text = '状态: 已连接';
+                    app.ClientStatusLabel.FontColor = [0 0.6 0]; % 绿色
+                    
+                    app.ServerPanel.Enable = 'off'; % 禁用服务端面板
+                    app.SendBtn.Enable = 'on';
+            end
+        end
+        
+        function onKeyPress(app, ~, event)
+            % 快捷键处理（Ctrl+Enter发送）
+            if strcmp(event.Key, 'return') && strcmp(event.Modifier, 'control')
+                app.sendMessage();
+            end
+        end
+    end
+    
+    % =====================================================================
+    % 界面初始化区域
+    % =====================================================================
+    methods (Access = private)
+        function createComponents(app)
+            % 1. 创建主窗口
+            app.UIFigure = uifigure('Position',[100 100 800 600]);
+            app.UIFigure.Name = '局域网双机聊天 - MATLAB App';
+            app.UIFigure.Color = '#F0F0F0';
+            app.UIFigure.WindowKeyPressFcn = @app.onKeyPress; % 绑定按键
+            
+            % 2. 主网格布局 (分三行: 顶控制150px, 中聊天1x, 底输入100px)
+            app.MainGrid = uigridlayout(app.UIFigure);
+            app.MainGrid.ColumnWidth = {'1x'};
+            app.MainGrid.RowHeight = {150, '1x', 100};
+            
+            % 3. 顶部网格 (1行2列)
+            app.TopGrid = uigridlayout(app.MainGrid);
+            app.TopGrid.Layout.Row = 1;
+            app.TopGrid.Layout.Column = 1;
+            app.TopGrid.ColumnWidth = {'1x', '1x'};
+            app.TopGrid.RowHeight = {'1x'};
+            app.TopGrid.Padding =[0 0 0 0];
+            
+            %% 3.1 左侧：服务端面板
+            app.ServerPanel = uipanel(app.TopGrid);
+            app.ServerPanel.Title = '服务端设置 (Server)';
+            app.ServerPanel.Layout.Row = 1;
+            app.ServerPanel.Layout.Column = 1;
+            
+            uilabel(app.ServerPanel, 'Position',[20 80 80 22], 'Text', '监听端口:');
+            app.ServerPortEdit = uieditfield(app.ServerPanel, 'numeric', 'Position', [100 80 100 22]);
+            app.ServerPortEdit.Value = 8888;
+            
+            app.ServerStartBtn = uibutton(app.ServerPanel, 'push', 'Position',[20 40 80 30], 'Text', '启动监听');
+            app.ServerStartBtn.ButtonPushedFcn = @app.startServer;
+            
+            app.ServerStopBtn = uibutton(app.ServerPanel, 'push', 'Position', [120 40 80 30], 'Text', '停止监听', 'Enable', 'off');
+            app.ServerStopBtn.ButtonPushedFcn = @app.stopServer;
+            
+            app.ServerStatusLabel = uilabel(app.ServerPanel, 'Position', [20 10 200 22], 'Text', '状态: 未启动', 'FontWeight', 'bold', 'FontColor', [0.6 0 0]);
+            
+            %% 3.2 右侧：客户端面板
+            app.ClientPanel = uipanel(app.TopGrid);
+            app.ClientPanel.Title = '客户端设置 (Client)';
+            app.ClientPanel.Layout.Row = 1;
+            app.ClientPanel.Layout.Column = 2;
+            
+            uilabel(app.ClientPanel, 'Position', [20 95 80 22], 'Text', '服务端 IP:');
+            app.ClientIPEdit = uieditfield(app.ClientPanel, 'text', 'Position', [100 95 150 22]);
+            app.ClientIPEdit.Value = '127.0.0.1';
+            
+            uilabel(app.ClientPanel, 'Position', [20 65 80 22], 'Text', '目标端口:');
+            app.ClientPortEdit = uieditfield(app.ClientPanel, 'numeric', 'Position', [100 65 100 22]);
+            app.ClientPortEdit.Value = 8888;
+            
+            app.ClientConnectBtn = uibutton(app.ClientPanel, 'push', 'Position',[20 25 80 30], 'Text', '连接');
+            app.ClientConnectBtn.ButtonPushedFcn = @app.connectToServer;
+            
+            app.ClientDisconnBtn = uibutton(app.ClientPanel, 'push', 'Position', [120 25 80 30], 'Text', '断开', 'Enable', 'off');
+            app.ClientDisconnBtn.ButtonPushedFcn = @app.disconnectFromServer;
+            
+            app.ClientStatusLabel = uilabel(app.ClientPanel, 'Position', [20 5 200 22], 'Text', '状态: 未连接', 'FontWeight', 'bold', 'FontColor', [0.6 0 0]);
+            
+            %% 4. 中部：聊天记录区
+            app.ChatHistoryArea = uitextarea(app.MainGrid);
+            app.ChatHistoryArea.Layout.Row = 2;
+            app.ChatHistoryArea.Layout.Column = 1;
+            app.ChatHistoryArea.Editable = 'off';
+            app.ChatHistoryArea.FontName = 'Courier New'; % 等宽字体
+            app.ChatHistoryArea.FontSize = 14;
+            app.ChatHistoryArea.Value = {'=== 欢迎使用 MATLAB 局域网聊天 App ===', '提示：按 Ctrl+Enter 快捷发送消息'};
+            
+            %% 5. 底部：消息输入区 (1行2列)
+            app.BottomGrid = uigridlayout(app.MainGrid);
+            app.BottomGrid.Layout.Row = 3;
+            app.BottomGrid.Layout.Column = 1;
+            app.BottomGrid.ColumnWidth = {'1x', 120};
+            app.BottomGrid.RowHeight = {'1x'};
+            app.BottomGrid.Padding = [0 0 0 0];
+            
+            app.MessageInputField = uitextarea(app.BottomGrid);
+            app.MessageInputField.Layout.Row = 1;
+            app.MessageInputField.Layout.Column = 1;
+            app.MessageInputField.FontSize = 14;
+            
+            app.SendBtn = uibutton(app.BottomGrid, 'push');
+            app.SendBtn.Layout.Row = 1;
+            app.SendBtn.Layout.Column = 2;
+            app.SendBtn.Text = '发 送';
+            app.SendBtn.FontSize = 16;
+            app.SendBtn.FontWeight = 'bold';
+            app.SendBtn.Enable = 'off';
+            app.SendBtn.ButtonPushedFcn = @app.sendMessage;
+            
+            % 初始化应用状态
+            app.ConnectionMode = 'none';
+            app.IsConnected = false;
+        end
+    end
+    
+    % =====================================================================
+    % 构造与析构
+    % =====================================================================
+    methods (Access = public)
+        function app = LanChatApp
+            % 创建组件并居中窗口
+            createComponents(app);
+            movegui(app.UIFigure, 'center');
+            
+            % 注册App以支持App Designer框架
+            registerApp(app, app.UIFigure);
+        end
+        
+        function delete(app)
+            % 应用关闭时的资源清理机制
+            try
+                if ~isempty(app.Server)
+                    delete(app.Server);
+                end
+                if ~isempty(app.Client)
+                    delete(app.Client);
+                end
+            catch
+                % 忽略关闭时发生的错误
+            end
+            delete(app.UIFigure);
+        end
+    end
+end
